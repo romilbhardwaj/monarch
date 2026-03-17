@@ -1,38 +1,47 @@
 # SkyPilot YAML for running the Monarch Quickstart example.
 #
-# This YAML file syncs the example directory, installs dependencies,
-# and runs the quickstart example.
+# Launch modes:
+#   sky launch  — provisions a persistent cluster (good for development/debugging)
+#   sky jobs launch — runs as a fault-tolerant managed job with spot recovery
 #
 # Usage:
 #   cd monarch/examples/skypilot
+#
+#   # Persistent cluster:
 #   sky launch monarch_quickstart.sky.yaml -c monarch-demo
 #
-#   # For CPU-only clusters (no GPUs):
+#   # Managed job (spot recovery, preferred for production):
+#   sky jobs launch monarch_quickstart.sky.yaml
+#
+#   # CPU-only (no GPUs on workers):
 #   sky launch monarch_quickstart.sky.yaml -c monarch-demo --env GPUS_PER_HOST=0 --env ACCELERATOR=none
 #
-# To view logs:
-#   sky logs monarch-demo
+#   # Heterogeneous: GPU trainers + CPU dataloaders
+#   sky jobs launch monarch_quickstart.sky.yaml --env NUM_DATALOADER_HOSTS=1
 #
-# To SSH into the cluster:
-#   sky ssh monarch-demo
-#
-# To tear down:
-#   sky down monarch-demo
+# Monitor (managed job mode):
+#   sky jobs logs monarch-quickstart   # driver logs
+#   sky jobs logs monarch-workers      # worker logs
+#   sky jobs queue                     # status of all jobs
 
 name: monarch-quickstart
 
 resources:
   cloud: kubernetes # Optional, remove or change to your preferred cloud provider
-  cpus: 2+ # No GPUs needed for the driver script
+  cpus: 2+          # No GPUs needed for the driver script
   image_id: docker:pytorch/pytorch:2.9.1-cuda12.8-cudnn9-runtime
 
-# Environment variables for configuring the example
-# Override with: sky launch ... --env NUM_HOSTS=4 --env GPUS_PER_HOST=8
+# Uncomment to use a remote SkyPilot API server (e.g., SkyPilot deployed on K8s).
+# When omitted, a local API server is started inside this pod during setup.
+# api_access: true
+
+# Environment variables — override with: sky launch ... --env NUM_HOSTS=4 --env GPUS_PER_HOST=8
 envs:
-  NUM_HOSTS: 2           # Number of worker nodes to provision
-  GPUS_PER_HOST: 1       # GPUs per worker (set to 0 for CPU-only)
-  ACCELERATOR: "H200:1"  # SkyPilot GPU spec (set to "none" for CPU-only). Keep quantity aligned with GPUS_PER_HOST.
-  JOB_NAME: "monarch-workers"  # Name for the managed job group
+  NUM_HOSTS: 2             # Number of worker nodes to provision
+  GPUS_PER_HOST: 1         # GPUs per worker (set to 0 for CPU-only)
+  ACCELERATOR: "H200:1"    # SkyPilot GPU spec (set to "none" for CPU-only). Keep quantity aligned with GPUS_PER_HOST.
+  NUM_DATALOADER_HOSTS: 0  # Additional CPU-only dataloader nodes (0 = none)
+  JOB_NAME: "monarch-workers"
 
 # Sync the current directory (examples/skypilot) to the cluster
 workdir: .
@@ -41,50 +50,45 @@ setup: |
   set -ex
 
   echo "=== Installing system dependencies ==="
-  # Install socat (required for SkyPilot Kubernetes portforward networking) and curl
   apt-get update && apt-get install -y socat curl
 
-  # Install kubectl for Kubernetes cluster management
   echo "=== Installing kubectl ==="
   curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-  chmod +x kubectl
-  mv kubectl /usr/local/bin/
+  chmod +x kubectl && mv kubectl /usr/local/bin/
   kubectl version --client || echo "kubectl installed"
 
   echo "=== Installing Python dependencies ==="
   uv pip install --system torchmonarch-nightly
-  # Install SkyPilot with Kubernetes support for launching nested clusters
   uv pip install --system "skypilot-nightly[kubernetes]"
 
-  # Verify installations
   python -c "import monarch; print(f'Monarch installed: {monarch}')"
   python -c "import sky; print(f'SkyPilot installed: {sky}')"
 
-  # Configure SkyPilot to use in-cluster Kubernetes context
-  # This allows the driver pod to launch nested SkyPilot clusters
+  # Start local SkyPilot API server.
+  # If api_access: true is set and a remote server is configured, this is a no-op.
   unset SKYPILOT_IN_CLUSTER_CONTEXT_NAME
   sky api start
 
-  # Verify Kubernetes access
   echo "=== Verifying Kubernetes access ==="
   sky check kubernetes
-
-  echo "=== GPUs available ==="
-  sky show-gpus --infra kubernetes
 
   echo "=== Setup complete ==="
 
 run: |
   echo "=== Running Monarch Quickstart with SkyPilot ==="
-  echo "Configuration: NUM_HOSTS=$NUM_HOSTS, GPUS_PER_HOST=$GPUS_PER_HOST, ACCELERATOR=$ACCELERATOR"
+  echo "NUM_HOSTS=$NUM_HOSTS GPUS_PER_HOST=$GPUS_PER_HOST ACCELERATOR=$ACCELERATOR"
 
-  # Run the getting started example
-  # Uses environment variables set above (can be overridden with --env)
+  DATALOADER_ARG=""
+  if [ "$NUM_DATALOADER_HOSTS" -gt "0" ]; then
+    DATALOADER_ARG="--num-dataloader-hosts $NUM_DATALOADER_HOSTS"
+  fi
+
   python skypilot_quickstart_driver.py \
     --cloud kubernetes \
-    --num-hosts $NUM_HOSTS \
-    --gpus-per-host $GPUS_PER_HOST \
+    --num-hosts "$NUM_HOSTS" \
+    --gpus-per-host "$GPUS_PER_HOST" \
+    --accelerator "$ACCELERATOR" \
     --job-name "$JOB_NAME" \
-    --accelerator "$ACCELERATOR"
+    $DATALOADER_ARG
 
   echo "=== Example ran successfully ==="
