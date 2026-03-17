@@ -6,17 +6,15 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-Running Monarch on Kubernetes / cloud VMs with SkyPilot JobGroups
-=================================================================
+Running Monarch on Kubernetes with SkyPilot
+===========================================
 
 This script demonstrates running Monarch actors on cloud infrastructure
 provisioned by SkyPilot using the JobGroup abstraction. Each Monarch mesh
 maps to a separate sky.Task with its own resource specification, all launched
 as a managed job (sky.jobs.launch) for spot recovery and SAME_INFRA placement.
 
-This driver must run inside the cluster (K8s pod or cloud VM). Launch it with:
-
-    sky jobs launch monarch_driver.sky.yaml
+This driver must run inside the K8s cluster.
 
 Prerequisites:
     pip install torchmonarch-nightly
@@ -30,10 +28,6 @@ Usage (from inside the cluster, or for local testing):
     # Heterogeneous: GPU trainers + CPU dataloaders
     python skypilot_quickstart_driver.py --cloud kubernetes \\
         --num-hosts 2 --accelerator H100:8 --num-dataloader-hosts 1
-
-    # Cloud VMs
-    python skypilot_quickstart_driver.py --cloud aws \\
-        --num-hosts 2 --accelerator H100:1
 """
 
 import argparse
@@ -67,12 +61,12 @@ from monarch_skypilot import SkyPilotJobGroup
 
 
 # ============================================================================
-# Actor definitions
+# Step 1: Define actors
 # ============================================================================
 
 
 class Counter(Actor):
-    """A simple counter actor demonstrating basic Monarch messaging."""
+    """A simple counter actor that demonstrates basic messaging."""
 
     def __init__(self, initial_value: int = 0):
         self.value = initial_value
@@ -87,7 +81,7 @@ class Counter(Actor):
 
 
 class Trainer(Actor):
-    """A trainer actor demonstrating distributed training patterns."""
+    """A trainer actor that demonstrates distributed training patterns."""
 
     @endpoint
     def step(self) -> str:
@@ -101,17 +95,21 @@ class Trainer(Actor):
 
 
 # ============================================================================
-# Cloud helpers
+# Step 2: Create a SkyPilot Job to provision k8s pods/cloud VMs
 # ============================================================================
 
 
 def get_cloud(cloud_name: str):
+    """Get SkyPilot cloud object from name."""
     clouds = {
         "kubernetes": sky.Kubernetes,
         "aws": sky.AWS,
         "gcp": sky.GCP,
         "azure": sky.Azure,
         "nebius": sky.Nebius,
+        # "slurm": sky.Slurm,
+        # "ssh": sky.SSH,
+        # TODO(romilb): Add other clouds
     }
     name = cloud_name.lower()
     if name not in clouds:
@@ -126,7 +124,7 @@ def get_cloud(cloud_name: str):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Monarch Getting Started with SkyPilot JobGroups"
+        description="Monarch Getting Started with SkyPilot"
     )
     parser.add_argument("--cloud", default="kubernetes",
                         help="Cloud provider (kubernetes, aws, gcp, azure, ...)")
