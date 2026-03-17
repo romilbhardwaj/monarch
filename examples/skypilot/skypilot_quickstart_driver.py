@@ -6,27 +6,34 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-Running Monarch on Kubernetes with SkyPilot
-===========================================
+Running Monarch on Kubernetes / cloud VMs with SkyPilot JobGroups
+=================================================================
 
 This script demonstrates running Monarch actors on cloud infrastructure
-provisioned by SkyPilot (Kubernetes or cloud VMs).
+provisioned by SkyPilot using the JobGroup abstraction. Each Monarch mesh
+maps to a separate sky.Task with its own resource specification, all launched
+as a managed job (sky.jobs.launch) for spot recovery and SAME_INFRA placement.
+
+This driver must run inside the cluster (K8s pod or cloud VM). Launch it with:
+
+    sky jobs launch monarch_driver.sky.yaml
 
 Prerequisites:
     pip install torchmonarch-nightly
-    pip install skypilot[kubernetes]  # or skypilot[aws], skypilot[gcp], etc.
-    sky check  # Verify SkyPilot configuration
-    sky show-gpus --infra kubernetes  # Verify GPUs available
+    pip install skypilot[kubernetes]  # or skypilot[aws], etc.
+    sky check
 
-Usage:
-    # Run on Kubernetes with 2 nodes, 8 GPUs per node
-    python skypilot_quickstart_driver.py --cloud kubernetes --num-hosts 2 --gpus-per-host 8 --accelerator "H200:8"
+Usage (from inside the cluster, or for local testing):
+    # Basic: 2-node homogeneous mesh on Kubernetes
+    python skypilot_quickstart_driver.py --cloud kubernetes --num-hosts 2
 
-    # Run on cloud VMs
-    python skypilot_quickstart_driver.py --cloud <aws/gcp/azure/...> --num-hosts 2 --gpus-per-host 1 --accelerator "H100:1"
+    # Heterogeneous: GPU trainers + CPU dataloaders
+    python skypilot_quickstart_driver.py --cloud kubernetes \\
+        --num-hosts 2 --accelerator H100:8 --num-dataloader-hosts 1
 
-    # Run on CPU-only cluster (no GPUs)
-    python skypilot_quickstart_driver.py --cloud kubernetes --num-hosts 2 --gpus-per-host 0 --accelerator none
+    # Cloud VMs
+    python skypilot_quickstart_driver.py --cloud aws \\
+        --num-hosts 2 --accelerator H100:1
 """
 
 import argparse
@@ -43,7 +50,6 @@ os.environ["HYPERACTOR_MESH_PROC_SPAWN_MAX_IDLE"] = "300s"
 if "SKYPILOT_IN_CLUSTER_CONTEXT_NAME" in os.environ:
     del os.environ["SKYPILOT_IN_CLUSTER_CONTEXT_NAME"]
 
-# Check dependencies before importing
 try:
     import sky
 except ImportError:
@@ -57,16 +63,16 @@ except ImportError as e:
     print("Run: pip install torchmonarch-nightly")
     sys.exit(1)
 
-# Import SkyPilotJob from the local package
-from monarch_skypilot import SkyPilotJob
+from monarch_skypilot import SkyPilotJobGroup
+
 
 # ============================================================================
-# Step 1: Define actors
+# Actor definitions
 # ============================================================================
 
 
 class Counter(Actor):
-    """A simple counter actor that demonstrates basic messaging."""
+    """A simple counter actor demonstrating basic Monarch messaging."""
 
     def __init__(self, initial_value: int = 0):
         self.value = initial_value
@@ -81,7 +87,7 @@ class Counter(Actor):
 
 
 class Trainer(Actor):
-    """A trainer actor that demonstrates distributed training patterns."""
+    """A trainer actor demonstrating distributed training patterns."""
 
     @endpoint
     def step(self) -> str:
@@ -95,184 +101,170 @@ class Trainer(Actor):
 
 
 # ============================================================================
-# Step 2: Create a SkyPilot Job to provision k8s pods/cloud VMs
+# Cloud helpers
 # ============================================================================
 
 
 def get_cloud(cloud_name: str):
-    """Get SkyPilot cloud object from name."""
     clouds = {
         "kubernetes": sky.Kubernetes,
         "aws": sky.AWS,
         "gcp": sky.GCP,
         "azure": sky.Azure,
         "nebius": sky.Nebius,
-        # "slurm": sky.Slurm,
-        # "ssh": sky.SSH,
-        # TODO(romilb): Add other clouds
     }
-    if cloud_name.lower() not in clouds:
-        raise ValueError(
-            f"Unknown cloud: {cloud_name}. Available: {list(clouds.keys())}"
-        )
-    return clouds[cloud_name.lower()]()
+    name = cloud_name.lower()
+    if name not in clouds:
+        raise ValueError(f"Unknown cloud: {cloud_name}. Available: {list(clouds.keys())}")
+    return clouds[name]()
+
+
+# ============================================================================
+# Main
+# ============================================================================
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Monarch Getting Started with SkyPilot"
+        description="Monarch Getting Started with SkyPilot JobGroups"
     )
-    parser.add_argument(
-        "--cloud",
-        default="kubernetes",
-        help="Cloud provider to use (kubernetes, aws, gcp, azure, ssh)",
-    )
-    parser.add_argument(
-        "--num-hosts",
-        type=int,
-        default=2,
-        help="Number of host nodes to provision",
-    )
-    parser.add_argument(
-        "--gpus-per-host",
-        type=int,
-        default=1,
-        help="Number of GPU processes per host",
-    )
-    parser.add_argument(
-        "--cluster-name",
-        default="monarch-getting-started",
-        help="Name for the SkyPilot cluster",
-    )
-    parser.add_argument(
-        "--accelerator",
-        default="H200:1",
-        help="GPU accelerator to request (e.g., H100:1, A100:1, V100:1)",
-    )
-    parser.add_argument(
-        "--region",
-        default=None,
-        help="Cloud region/Kubernetes context to use",
-    )
+    parser.add_argument("--cloud", default="kubernetes",
+                        help="Cloud provider (kubernetes, aws, gcp, azure, ...)")
+    parser.add_argument("--num-hosts", type=int, default=2,
+                        help="Number of trainer nodes")
+    parser.add_argument("--gpus-per-host", type=int, default=1,
+                        help="GPU processes per trainer node")
+    parser.add_argument("--accelerator", default="H200:1",
+                        help="GPU accelerator spec (e.g. H100:1, A100:1)")
+    parser.add_argument("--num-dataloader-hosts", type=int, default=0,
+                        help="Number of CPU dataloader nodes (0 = no dataloader mesh)")
+    parser.add_argument("--job-name", default="monarch-getting-started",
+                        help="Name for the managed job group")
+    parser.add_argument("--region", default=None,
+                        help="Cloud region or Kubernetes context")
     args = parser.parse_args()
 
-    # Determine if running in CPU-only mode
     cpu_only = args.gpus_per_host == 0 or args.accelerator.lower() == "none"
 
     print("=" * 60)
-    print("Monarch Getting Started with SkyPilot")
+    print("Monarch Getting Started with SkyPilot JobGroups")
     print("=" * 60)
     print(f"\nConfiguration:")
-    print(f"  Cloud: {args.cloud}")
-    print(f"  Hosts: {args.num_hosts}")
-    if cpu_only:
-        print(f"  Mode: CPU-only (no GPUs)")
-    else:
-        print(f"  GPUs per host: {args.gpus_per_host}")
-        print(f"  Accelerator: {args.accelerator}")
-    print(f"  Cluster name: {args.cluster_name}")
-    if args.region:
-        print(f"  Region: {args.region}")
-
-    # Create a SkyPilotJob to provision nodes
-    print("\n[1] Creating SkyPilot job...")
-
-    # Build resources specification
-    resources_kwargs = {
-        "cloud": get_cloud(args.cloud),
-    }
-    # Only request GPUs if not in CPU-only mode
+    print(f"  Cloud:      {args.cloud}")
+    print(f"  Trainers:   {args.num_hosts} nodes", end="")
     if not cpu_only:
-        resources_kwargs["accelerators"] = args.accelerator
+        print(f" x {args.accelerator}")
+    else:
+        print(" (CPU only)")
+    if args.num_dataloader_hosts > 0:
+        print(f"  Dataloaders: {args.num_dataloader_hosts} CPU nodes")
+    print(f"  Job name:   {args.job_name}")
     if args.region:
-        resources_kwargs["region"] = args.region
+        print(f"  Region:     {args.region}")
 
-    # Create a SkyPilotJob to provision nodes
-    job = SkyPilotJob(
-        # Define the mesh of hosts we need
-        meshes={"trainers": args.num_hosts},
-        resources=sky.Resources(**resources_kwargs),
-        cluster_name=args.cluster_name,
-        # Auto-cleanup after 10 minutes of idle time (recommended for auto clean up if the job/controller fails)
-        idle_minutes_to_autostop=10,
-        down_on_autostop=True,
+    # ------------------------------------------------------------------
+    # Build resource specs
+    # ------------------------------------------------------------------
+    trainer_resources_kwargs = {"cloud": get_cloud(args.cloud)}
+    if not cpu_only:
+        trainer_resources_kwargs["accelerators"] = args.accelerator
+    if args.region:
+        trainer_resources_kwargs["region"] = args.region
+    trainer_resources = sky.Resources(**trainer_resources_kwargs)
+
+    # Build meshes dict — heterogeneous if dataloaders are requested
+    if args.num_dataloader_hosts > 0:
+        dataloader_resources = sky.Resources(
+            cloud=get_cloud(args.cloud),
+            **({"region": args.region} if args.region else {}),
+        )
+        meshes = {
+            "trainers":    (args.num_hosts, trainer_resources),
+            "dataloaders": (args.num_dataloader_hosts, dataloader_resources),
+        }
+        primary_meshes = ["trainers"]
+        termination_delays = {"dataloaders": "30s"}
+    else:
+        meshes = {"trainers": args.num_hosts}
+        primary_meshes = None
+        termination_delays = None
+
+    # ------------------------------------------------------------------
+    # Create job group
+    # ------------------------------------------------------------------
+    print("\n[1] Creating SkyPilotJobGroup...")
+    job = SkyPilotJobGroup(
+        meshes=meshes,
+        default_resources=trainer_resources,  # used for plain-int meshes
+        job_name=args.job_name,
+        primary_meshes=primary_meshes,
+        termination_delays=termination_delays,
     )
 
     try:
-        # Get the job state - this launches the cluster and returns HostMeshes
-        print("\n[2] Launching cluster and starting Monarch workers...")
+        # Launches all mesh tasks in parallel as a managed job group,
+        # then waits for all to reach RUNNING status
+        print("\n[2] Launching job group and starting Monarch workers...")
         state = job.state()
 
-        # Get our host mesh
         hosts = state.trainers
-        print(f"    Got host mesh with extent: {hosts.extent}")
+        print(f"    Trainer host mesh extent: {hosts.extent}")
 
-        # ====================================================================
-        # Step 3: Spawn processes and actors on the cloud hosts
-        # ====================================================================
-
-        print("\n[3] Spawning processes on cloud hosts...")
-        # Create a process mesh
+        # ------------------------------------------------------------------
+        # Spawn processes and actors
+        # ------------------------------------------------------------------
+        print("\n[3] Spawning processes on trainer hosts...")
         if cpu_only:
-            # CPU-only mode: spawn 1 CPU process per host
             procs: ProcMesh = hosts.spawn_procs(per_host={"procs": 1})
         else:
             procs: ProcMesh = hosts.spawn_procs(per_host={"gpus": args.gpus_per_host})
         print(f"    Process mesh extent: {procs.extent}")
 
-        # Spawn counter actors
         print("\n[4] Spawning Counter actors...")
         counters: Counter = procs.spawn("counters", Counter, initial_value=0)
 
-        # ====================================================================
-        # Step 4: Interact with the actors
-        # ====================================================================
-
-        # Broadcast increment to all counters
         print("\n[5] Broadcasting increment to all counters...")
         counters.increment.broadcast()
         counters.increment.broadcast()
         counters.increment.broadcast()
 
-        # Get all counter values
         print("\n[6] Getting counter values...")
         values = counters.get_value.call().get()
         print(f"    Counter values: {values}")
+        # ValueMesh iterates as (rank_dict, value) tuples
+        flat_values = [v for _, v in values]
+        assert all(v == 3 for v in flat_values), f"Expected all 3, got {flat_values}"
+        print("    OK — all counters are 3")
 
-        # Spawn trainer actors
         print("\n[7] Spawning Trainer actors...")
         trainers: Trainer = procs.spawn("trainers", Trainer)
 
-        # Do a training step
         print("\n[8] Performing distributed training step...")
         results = trainers.step.call().get()
         for r in results:
             print(f"    {r}")
 
-        # Get trainer info
         print("\n[9] Getting trainer info...")
         info = trainers.get_info.call().get()
         for i in info:
             print(f"    {i}")
 
         print("\n" + "=" * 60)
-        print("Success! Monarch actors ran on SkyPilot cluster!")
+        print("Success! Monarch actors ran on SkyPilot JobGroup cluster!")
         print("=" * 60)
 
     except Exception as e:
         print(f"\nERROR: {e}")
         import traceback
-
         traceback.print_exc()
-        print(f"\n[10] ERROR - not cleaning up cluster for debugging...")
-        print(f"    You can debug with: sky ssh {args.cluster_name}")
-        print(f"    To clean up later: sky down {args.cluster_name}")
+        print(f"\n[10] ERROR — not cleaning up job for debugging.")
+        print(f"    To view logs:  sky jobs logs {args.job_name}")
+        print(f"    To clean up:   sky jobs cancel {args.job_name}")
         raise
     else:
-        # Clean up - tear down the SkyPilot cluster
-        print("\n[10] Cleaning up SkyPilot cluster...")
+        print("\n[10] Cancelling managed job group...")
         job.kill()
-        print("    Cluster terminated.")
+        print("    Job group cancelled.")
 
 
 if __name__ == "__main__":

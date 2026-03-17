@@ -5,9 +5,11 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-Monarch JobTrait implementation for SkyPilot.
+Monarch JobTrait implementation for SkyPilot using JobGroups.
 
-SkyPilotJob allows running Monarch on Kubernetes and cloud VMs via SkyPilot.
+SkyPilotJobGroup allows running Monarch on Kubernetes and cloud VMs via SkyPilot,
+using SkyPilot's JobGroup abstraction (sky.Dag with parallel execution) to map
+each Monarch mesh to a separate sky.Task with its own resource specification.
 
 Requirements:
     - pip install torchmonarch-nightly (or torchmonarch)
@@ -17,7 +19,7 @@ Requirements:
 import logging
 import os
 import time
-from typing import Dict, List, Optional, TYPE_CHECKING
+from typing import Dict, List, Optional, Tuple, Union, TYPE_CHECKING
 
 from monarch._src.job.job import JobState, JobTrait
 
@@ -29,14 +31,19 @@ if "SKYPILOT_IN_CLUSTER_CONTEXT_NAME" in os.environ:
 
 if TYPE_CHECKING:
     import sky
+    from sky.schemas.api import responses as sky_responses
 
 try:
     import sky
+    import sky.jobs as sky_jobs
+    from sky.dag import DagExecution as _DagExecution
 
     HAS_SKYPILOT = True
 except ImportError:
     HAS_SKYPILOT = False
     sky = None  # type: ignore[assignment]
+    sky_jobs = None  # type: ignore[assignment]
+    _DagExecution = None  # type: ignore[assignment]
 
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -44,13 +51,11 @@ logger: logging.Logger = logging.getLogger(__name__)
 # Default port for Monarch TCP communication
 MONARCH_WORKER_PORT = 22222
 
-# Timeout for waiting for the job to reach RUNNING status.
-JOB_TIMEOUT = 300  # seconds
+# Timeout for waiting for all job group tasks to reach RUNNING status.
+JOB_TIMEOUT = 600  # seconds
 
 # Default setup commands to install Monarch from PyPI on remote workers.
 # Requires a Docker image with Ubuntu 22.04+ with RDMA dependencies.
-# In this implementation, we default to pytorch/pytorch:2.9.1-cuda12.8-cudnn9-runtime image.
-#
 # For faster cold starts (<30s), use a custom Docker image with Monarch pre-installed.
 DEFAULT_SETUP_COMMANDS = """
 set -ex
@@ -61,6 +66,9 @@ uv pip install --system torchmonarch-nightly
 echo "Done installing Monarch"
 """
 DEFAULT_IMAGE_ID = "docker:pytorch/pytorch:2.9.1-cuda12.8-cudnn9-runtime"
+
+# Type alias: mesh spec is either just a node count or (count, Resources)
+MeshSpec = Union[int, Tuple[int, "sky.Resources"]]
 
 
 def _configure_transport() -> None:
@@ -77,43 +85,79 @@ def _attach_to_workers_wrapper(name: str, ca: str, workers: List[str]):
     return attach_to_workers(name=name, ca=ca, workers=workers)
 
 
-class SkyPilotJob(JobTrait):
+def _resolve_meshes(
+    meshes: Dict[str, MeshSpec],
+    default_resources: Optional["sky.Resources"],
+) -> Dict[str, Tuple[int, "sky.Resources"]]:
+    """Normalize meshes dict to Dict[name, (num_nodes, Resources)]."""
+    resolved: Dict[str, Tuple[int, "sky.Resources"]] = {}
+    fallback = default_resources or sky.Resources(image_id=DEFAULT_IMAGE_ID)
+    for name, spec in meshes.items():
+        if isinstance(spec, int):
+            resources = fallback
+            num_nodes = spec
+        else:
+            num_nodes, resources = spec
+        # Ensure DEFAULT_IMAGE_ID is set if no image specified
+        if resources.image_id is None:
+            resources = resources.copy(image_id=DEFAULT_IMAGE_ID)
+        resolved[name] = (num_nodes, resources)
+    return resolved
+
+
+class SkyPilotJobGroup(JobTrait):
     """
-    SkyPilotJob to provision and manage Monarch workers K8s and cloud VMs.
+    SkyPilotJobGroup provisions and manages Monarch workers on K8s and cloud VMs
+    using SkyPilot's JobGroup abstraction.
 
-    SkyPilot supports multiple backends - Kubernetes and VMs on AWS, GCP, Azure,
-    CoreWeave, Nebius, and 20+ other clouds.
+    Each named Monarch mesh maps to a sky.Task in a sky.Dag(execution=PARALLEL).
+    This enables:
+      - Heterogeneous resources: each mesh can have its own sky.Resources
+      - SAME_INFRA placement: all meshes land on the same cloud + region
+      - Spot recovery: sky.jobs.launch() automatically recovers from preemptions
+      - Lifecycle management: primary_meshes / termination_delays control shutdown
 
-    This implementation:
-    1. Uses sky.launch() to provision cloud instances with specified resources
-    2. Runs Monarch workers on each node via a startup script
-    3. Connects to workers using their IP addresses from the cluster handle
+    Worker addresses are discovered via sky.jobs.queue_v2() (not from cluster
+    handles), using internal_services K8s DNS (stable across preemptions) or
+    internal_external_ips as a fallback.
 
-    Caveats:
-      * For Kubernetes, the driver/client must be run inside the same cluster.
-        TOOD(romilb): Explore if loadbalancer can be used to connect to workers.
+    The driver that instantiates this class must itself run inside the cluster
+    (K8s pod or cloud VM). When using a remote SkyPilot API server, set
+    api_access: true on the driver task YAML; when using a local API server,
+    omit it (SkyPilot will auto-start a local server inside the driver pod).
 
-    Example:
+    Example (homogeneous):
         >>> import sky
-        >>> from monarch_skypilot import SkyPilotJob
+        >>> from monarch_skypilot import SkyPilotJobGroup
         >>>
-        >>> job = SkyPilotJob(
-        ...     meshes={"trainers": 2},
-        ...     resources=sky.Resources(accelerators="A100:1"),
-        ...     cluster_name="my-monarch-cluster",
+        >>> job = SkyPilotJobGroup(
+        ...     meshes={"trainers": 4},
+        ...     default_resources=sky.Resources(
+        ...         cloud=sky.Kubernetes(), accelerators="H100:8"
+        ...     ),
         ... )
         >>> state = job.state()
-        >>> trainers = state.trainers  # HostMesh with 2 nodes
+        >>> trainers = state.trainers  # HostMesh with 4 nodes
+
+    Example (heterogeneous):
+        >>> job = SkyPilotJobGroup(
+        ...     meshes={
+        ...         "trainers":    (4, sky.Resources(accelerators="H100:8")),
+        ...         "dataloaders": (2, sky.Resources(cpus="32")),
+        ...     },
+        ...     primary_meshes=["trainers"],
+        ...     termination_delays={"dataloaders": "30s"},
+        ... )
     """
 
     def __init__(
         self,
-        meshes: Dict[str, int],
-        resources: Optional["sky.Resources"] = None,
-        cluster_name: Optional[str] = None,
+        meshes: Dict[str, MeshSpec],
+        default_resources: Optional["sky.Resources"] = None,
+        job_name: Optional[str] = None,
+        primary_meshes: Optional[List[str]] = None,
+        termination_delays: Optional[Dict[str, str]] = None,
         monarch_port: int = MONARCH_WORKER_PORT,
-        idle_minutes_to_autostop: Optional[int] = None,
-        down_on_autostop: bool = True,
         python_exe: str = "python",
         setup_commands: Optional[str] = None,
         workdir: Optional[str] = None,
@@ -121,215 +165,250 @@ class SkyPilotJob(JobTrait):
     ) -> None:
         """
         Args:
-            meshes: Dictionary mapping mesh names to number of nodes.
-                    e.g., {"trainers": 4, "dataloaders": 2}
-            resources: SkyPilot Resources specification for the instances.
-                       If None, uses SkyPilot defaults.
-            cluster_name: Name for the SkyPilot cluster. If None, auto-generated.
-            monarch_port: Port bootstrapping communication between Monarch workers.
-            idle_minutes_to_autostop: If set, cluster will autostop after this
-                                      many minutes of idleness.
-            down_on_autostop: If True, tear down cluster on autostop instead of
-                              just stopping it. On Kubernetes, autostop is not
-                              supported and this must be set to True. Pods will
-                              be deleted when the SkyPilot cluster is downed.
-            python_exe: Python executable to use for worker processes.
-            setup_commands: Optional setup commands to run before starting workers.
-                           If None, uses DEFAULT_SETUP_COMMANDS which installs
-                           torchmonarch-nightly from PyPI.
-            workdir: Local directory to sync to the cluster. If provided, this
-                    directory will be uploaded to ~/sky_workdir on each node.
-            file_mounts: Dictionary mapping remote paths to local paths for
-                        additional file mounts.
+            meshes: Dict mapping mesh names to either:
+                - int: number of nodes (uses default_resources)
+                - (int, sky.Resources): number of nodes + per-mesh resources
+              e.g. {"trainers": 4}
+              e.g. {"trainers": (4, sky.Resources(accelerators="H100:8")),
+                    "dataloaders": (2, sky.Resources(cpus="32"))}
+            default_resources: Fallback sky.Resources for meshes specified as
+                               plain int. Required if any mesh uses int form.
+            job_name: Name for the managed job group. Auto-generated if None.
+            primary_meshes: Names of "primary" meshes. When all primary tasks
+                            complete, auxiliary meshes are terminated. If None,
+                            all meshes are primary.
+            termination_delays: Grace period before auxiliary meshes are killed
+                                after primary meshes complete.
+                                e.g. {"dataloaders": "30s"} or {"default": "1m"}
+            monarch_port: TCP port for Monarch worker communication.
+            python_exe: Python executable on remote nodes.
+            setup_commands: Setup script run before workers start. Defaults to
+                           installing torchmonarch-nightly from PyPI.
+            workdir: Local directory to sync to ~/sky_workdir on each node.
+            file_mounts: Additional file mounts {remote_path: local_path}.
         """
         if not HAS_SKYPILOT:
             raise ImportError(
-                "SkyPilot is not installed. Install it with: pip install skypilot[kubernetes]"
+                "SkyPilot is not installed. Install with: pip install skypilot[kubernetes]"
             )
 
-        # Configure transport at runtime when Monarch is available
         try:
             _configure_transport()
         except ImportError:
-            # Monarch bindings not available, will fail later when needed
             pass
 
         super().__init__()
 
-        self._meshes = meshes
-        self._resources = resources
-        self._cluster_name = cluster_name
+        self._meshes_input = meshes
+        self._default_resources = default_resources
+        self._job_name = job_name or f"monarch-{os.getpid()}"
+        self._primary_meshes = primary_meshes
+        self._termination_delays = termination_delays
         self._port = monarch_port
-        self._idle_minutes_to_autostop = idle_minutes_to_autostop
-        self._down_on_autostop = down_on_autostop
         self._python_exe = python_exe
         self._setup_commands = setup_commands
         self._workdir = workdir
         self._file_mounts = file_mounts
 
-        # Runtime state
-        self._launched_cluster_name: Optional[str] = None
-        self._node_ips: List[str] = []
+        # Resolved at _create() time
+        self._resolved: Optional[Dict[str, Tuple[int, "sky.Resources"]]] = None
 
-    def _cleanup_on_failure(self) -> None:
-        """Clean up cluster resources on failure."""
-        if self._launched_cluster_name:
-            try:
-                logger.warning(
-                    f"Cleaning up cluster '{self._launched_cluster_name}' after failure"
-                )
-                request_id = sky.down(self._launched_cluster_name)
-                sky.get(request_id)
-                logger.info(f"Cluster '{self._launched_cluster_name}' cleaned up")
-            except Exception as cleanup_error:
-                logger.warning(f"Failed to cleanup cluster: {cleanup_error}")
-            finally:
-                self._launched_cluster_name = None
-                self._node_ips.clear()
+    # ------------------------------------------------------------------
+    # JobTrait implementation
+    # ------------------------------------------------------------------
 
     def _create(self, client_script: Optional[str]) -> None:
-        """Launch a SkyPilot cluster and start Monarch workers."""
+        """Build a JobGroup dag and launch it as a managed job."""
         if client_script is not None:
-            raise RuntimeError("SkyPilotJob cannot run batch-mode scripts yet")
+            raise RuntimeError("SkyPilotJobGroup cannot run batch-mode scripts yet")
 
-        total_nodes = sum(self._meshes.values())
+        self._resolved = _resolve_meshes(self._meshes_input, self._default_resources)
 
-        # Build the worker startup command
-        worker_command = self._build_worker_command()
-
-        # Use provided setup commands or default to PyPI install
-        setup = (
-            self._setup_commands
-            if self._setup_commands is not None
-            else DEFAULT_SETUP_COMMANDS
-        )
+        worker_cmd = self._build_worker_command()
+        setup = self._setup_commands if self._setup_commands is not None else DEFAULT_SETUP_COMMANDS
         if setup and not setup.endswith("\n"):
             setup += "\n"
 
-        # Create the SkyPilot task
-        task = sky.Task(
-            name="monarch-workers",
-            setup=setup if setup else None,
-            run=worker_command,
-            num_nodes=total_nodes,
-            workdir=self._workdir,
-        )
+        dag = sky.Dag()
+        dag.name = self._job_name
+        dag.set_execution(_DagExecution.PARALLEL)
 
-        # Add file mounts if provided
-        if self._file_mounts:
-            task.set_file_mounts(self._file_mounts)
-
-        # Set resources, using default image_id if not specified
-        resources = self._resources
-        if resources is not None:
-            if resources.image_id is None:
-                resources = resources.copy(image_id=DEFAULT_IMAGE_ID)
-            task.set_resources(resources)
-        else:
-            task.set_resources(sky.Resources(image_id=DEFAULT_IMAGE_ID))
-
-        # Generate cluster name if not provided
-        cluster_name = self._cluster_name or f"monarch-{os.getpid()}"
-
-        # Set early so cleanup can work if later steps fail
-        self._launched_cluster_name = cluster_name
-
-        logger.info(
-            f"Launching SkyPilot cluster '{cluster_name}' with {total_nodes} nodes"
-        )
-
-        # Launch the cluster
-        try:
-            request_id = sky.launch(
-                task,
-                cluster_name=cluster_name,
-                idle_minutes_to_autostop=self._idle_minutes_to_autostop,
-                down=self._down_on_autostop,
+        for mesh_name, (num_nodes, resources) in self._resolved.items():
+            task = sky.Task(
+                name=mesh_name,
+                setup=setup or None,
+                run=worker_cmd,
+                num_nodes=num_nodes,
+                workdir=self._workdir,
             )
-            # Get the result from the request
-            job_id, handle = sky.get(request_id)
-        except Exception as e:
-            logger.error(f"Failed to launch SkyPilot cluster: {e}")
-            self._cleanup_on_failure()
-            raise RuntimeError(f"Failed to launch SkyPilot cluster: {e}") from e
+            if self._file_mounts:
+                task.set_file_mounts(self._file_mounts)
+            task.set_resources(resources)
+            dag.add(task)
 
-        logger.info(f"SkyPilot cluster '{cluster_name}' launched successfully")
-
-        # Wait for the job to be RUNNING (setup complete, run started)
-        try:
-            self._wait_for_job_running(cluster_name, job_id, timeout=JOB_TIMEOUT)
-        except Exception as e:
-            logger.error(f"Job failed to reach RUNNING status: {e}")
-            self._cleanup_on_failure()
-            raise
-
-    def _wait_for_job_running(
-        self, cluster_name: str, job_id: int, timeout: int = JOB_TIMEOUT
-    ) -> None:
-        """Wait for the SkyPilot job to reach RUNNING status (setup complete)."""
-        start_time = time.time()
-        poll_interval = 10  # seconds
+        if self._primary_meshes:
+            dag.primary_tasks = self._primary_meshes
+        if self._termination_delays:
+            dag.termination_delay = self._termination_delays
 
         logger.info(
-            f"Waiting for job {job_id} setup to complete (timeout={timeout}s)..."
+            f"Launching JobGroup '{self._job_name}' with meshes: "
+            + ", ".join(f"{n}={c}" for n, (c, _) in self._resolved.items())
         )
 
-        while time.time() - start_time < timeout:
-            try:
-                # Get job queue for the cluster
-                request_id = sky.queue(cluster_name)
-                jobs = sky.get(request_id)
+        try:
+            request_id = sky_jobs.launch(dag, name=self._job_name)
+            sky.get(request_id)
+        except Exception as e:
+            logger.error(f"Failed to launch JobGroup '{self._job_name}': {e}")
+            raise RuntimeError(f"Failed to launch JobGroup: {e}") from e
 
-                # Find our job
-                for job in jobs:
-                    if job.get("id") == job_id or job.get("job_id") == job_id:
-                        status = job.get("status", "")
-                        status_str = str(status)
-                        if "RUNNING" in status_str:
-                            logger.info(f"Job {job_id} is now RUNNING (setup complete)")
-                            return
-                        elif "FAILED" in status_str or "CANCELLED" in status_str:
-                            raise RuntimeError(
-                                f"Job {job_id} failed with status: {status}. Check logs with: sky logs {cluster_name}"
-                            )
-                        else:
-                            elapsed = int(time.time() - start_time)
-                            logger.info(
-                                f"Job {job_id} status: {status} (waited {elapsed}s)"
-                            )
-                        break
+        logger.info(f"JobGroup '{self._job_name}' submitted, waiting for workers...")
+        self._wait_for_all_tasks_running(timeout=JOB_TIMEOUT)
 
-            except Exception as e:
-                logger.warning(f"Error checking job status: {e}")
+    def _state(self) -> JobState:
+        """Connect to workers and return JobState with HostMesh per mesh."""
+        if self._resolved is None:
+            raise RuntimeError("JobGroup has not been created yet")
 
-            time.sleep(poll_interval)
+        host_meshes = {}
+        for mesh_name, (num_nodes, _) in self._resolved.items():
+            workers = self._get_worker_addrs(mesh_name, num_nodes)
+            logger.info(f"Connecting to mesh '{mesh_name}' workers: {workers}")
 
-        raise RuntimeError(f"Timeout waiting for job {job_id} to reach RUNNING status")
+            host_mesh = _attach_to_workers_wrapper(
+                name=mesh_name,
+                ca="trust_all_connections",
+                workers=workers,
+            )
+            logger.info(f"Waiting for mesh '{mesh_name}' to initialize...")
+            host_mesh.initialized.get()
+            logger.info(f"Mesh '{mesh_name}' ready")
+
+            host_meshes[mesh_name] = host_mesh
+
+        return JobState(host_meshes)
+
+    def _kill(self) -> None:
+        """Cancel the managed job group."""
+        logger.info(f"Cancelling JobGroup '{self._job_name}'")
+        try:
+            request_id = sky_jobs.cancel(name=self._job_name)
+            sky.get(request_id)
+            logger.info(f"JobGroup '{self._job_name}' cancelled")
+        except Exception as e:
+            logger.warning(f"Failed to cancel JobGroup '{self._job_name}': {e}")
+
+    def can_run(self, spec: "JobTrait") -> bool:
+        """Check if this running job matches the given spec."""
+        if not isinstance(spec, SkyPilotJobGroup):
+            return False
+        if not self.active:
+            return False
+        return (
+            spec._meshes_input == self._meshes_input
+            and spec._default_resources == self._default_resources
+            and spec._port == self._port
+            and self._is_job_running()
+        )
+
+    # ------------------------------------------------------------------
+    # Worker discovery (via queue_v2, PR #8735)
+    # ------------------------------------------------------------------
+
+    def _get_worker_addrs(self, mesh_name: str, num_nodes: int) -> List[str]:
+        """Get TCP worker addresses for a mesh using queue_v2.
+
+        On K8s uses internal_services DNS (stable across spot preemptions since
+        the K8s service reroutes to the new pod). Falls back to
+        internal_external_ips on all clouds.
+
+        Note on task_name: For true multi-task JobGroups, each task record has
+        task_name = the Dag task name (e.g. "trainers"). For single-task managed
+        jobs (or single-task JobGroups), SkyPilot sets task_name = job_name.
+        We handle both cases.
+        """
+        from sky.jobs.client import sdk as jobs_sdk
+
+        request_id = jobs_sdk.queue_v2(refresh=False, skip_finished=False)
+        records, _, _, _ = sky.get(request_id)
+
+        all_named = [r for r in records if r.job_name == self._job_name]
+
+        # When a job name is reused, multiple records exist. Use only the latest.
+        if all_named:
+            latest_job_id = max(r.job_id for r in all_named)
+            job_records = [r for r in all_named if r.job_id == latest_job_id]
+        else:
+            job_records = []
+
+        # Multi-task JobGroup: task_name matches the Dag task/mesh name
+        record = next((r for r in job_records if r.task_name == mesh_name), None)
+
+        # Single-task fallback: SkyPilot uses job_name as task_name when there
+        # is only one task. This happens when the JobGroup has a single mesh.
+        if record is None and len(self._resolved) == 1:  # type: ignore[arg-type]
+            record = next(
+                (r for r in job_records if r.task_name == self._job_name), None
+            )
+
+        if record is None:
+            raise RuntimeError(
+                f"No job record found for mesh '{mesh_name}' in job '{self._job_name}'. "
+                f"Is the job still running?"
+            )
+
+        # K8s: internal_services gives stable *.svc.cluster.local DNS names,
+        # resolvable cluster-wide (not just from within the job group).
+        # (Added in SkyPilot PR #8735; use getattr for compat with older versions.)
+        internal_services = getattr(record, "internal_services", None)
+        if internal_services and len(internal_services) >= num_nodes:
+            return [
+                f"tcp://{dns}:{self._port}"
+                for dns in internal_services.values()
+                if dns
+            ]
+
+        # Fallback: raw IPs from internal_external_ips (all clouds).
+        # Prefer external IP; fall back to internal.
+        # (Also added in PR #8735; use getattr for compat.)
+        internal_external_ips = getattr(record, "internal_external_ips", None)
+        if internal_external_ips:
+            return [
+                f"tcp://{ext or intern_}:{self._port}"
+                for intern_, ext in internal_external_ips
+            ]
+
+        raise RuntimeError(
+            f"No IP or DNS information available for mesh '{mesh_name}'. "
+            f"The job may still be starting."
+        )
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
     def _build_worker_command(self) -> str:
-        """Build the bash command to start Monarch workers on each node."""
-        # This command will be run on each node via SkyPilot
-        # SkyPilot expects a bash script, so we wrap Python code in python -c
-        # Note: Use IP address (not hostname) for the worker address since
-        # Kubernetes hostnames may not resolve across pods
+        """Build the bash command to start a Monarch worker on each node."""
         python_code = f"""
 import socket
 import logging
 import sys
 
-# Enable verbose logging
-logging.basicConfig(level=logging.DEBUG, stream=sys.stdout, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logging.basicConfig(
+    level=logging.DEBUG,
+    stream=sys.stdout,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 
 hostname = socket.gethostname()
 ip_addr = socket.gethostbyname(hostname)
 address = f"tcp://{{ip_addr}}:{self._port}"
 print(f"Starting Monarch worker at {{address}} (hostname={{hostname}})", flush=True)
-sys.stdout.flush()
 
 try:
     from monarch.actor import run_worker_loop_forever
-    print(f"Imported run_worker_loop_forever successfully", flush=True)
-    print(f"Worker ready and listening...", flush=True)
+    print("Worker ready and listening...", flush=True)
     run_worker_loop_forever(address=address, ca="trust_all_connections")
 except Exception as e:
     print(f"ERROR in worker: {{e}}", flush=True)
@@ -337,161 +416,108 @@ except Exception as e:
     traceback.print_exc()
     raise
 """
-        # Escape single quotes in the Python code for bash
-        escaped_code = python_code.replace("'", "'\"'\"'")
-        # Set timeout env vars
-        env_vars = " ".join(
-            [
-                f"export HYPERACTOR_HOST_SPAWN_READY_TIMEOUT={JOB_TIMEOUT}s",
-                f"export HYPERACTOR_MESSAGE_DELIVERY_TIMEOUT={JOB_TIMEOUT}s",
-                f"export HYPERACTOR_MESH_PROC_SPAWN_MAX_IDLE={JOB_TIMEOUT}s",
-            ]
+        escaped = python_code.replace("'", "'\"'\"'")
+        env_vars = (
+            f"export HYPERACTOR_HOST_SPAWN_READY_TIMEOUT={JOB_TIMEOUT}s && "
+            f"export HYPERACTOR_MESSAGE_DELIVERY_TIMEOUT={JOB_TIMEOUT}s && "
+            f"export HYPERACTOR_MESH_PROC_SPAWN_MAX_IDLE={JOB_TIMEOUT}s"
         )
-        return f"{env_vars} && {self._python_exe} -c '{escaped_code}'"
+        return f"{env_vars} && {self._python_exe} -c '{escaped}'"
 
-    def _get_node_ips(self) -> List[str]:
-        """Get the IP addresses of all nodes in the cluster."""
-        if not self._launched_cluster_name:
-            raise RuntimeError("Cluster has not been launched yet")
+    def _wait_for_all_tasks_running(self, timeout: int = JOB_TIMEOUT) -> None:
+        """Poll queue_v2 until all mesh tasks are RUNNING."""
+        from sky.jobs.client import sdk as jobs_sdk
+        from sky.jobs import state as managed_job_state
 
-        # Query cluster status to get handle with node IPs
-        try:
-            request_id = sky.status(cluster_names=[self._launched_cluster_name])
-            statuses = sky.get(request_id)
-        except Exception as e:
-            raise RuntimeError(f"Failed to get cluster status: {e}") from e
+        expected = set(self._resolved.keys())  # type: ignore[union-attr]
+        start = time.time()
+        poll_interval = 10
 
-        if not statuses:
-            raise RuntimeError(f"Cluster '{self._launched_cluster_name}' not found")
-
-        status = statuses[0]
-        handle = status.handle
-
-        if handle is None:
-            raise RuntimeError(f"Cluster '{self._launched_cluster_name}' has no handle")
-
-        # Get the external IPs from the handle
-        if handle.stable_internal_external_ips is None:
-            raise RuntimeError("Cluster has no IP information")
-
-        # stable_internal_external_ips is List[Tuple[internal_ip, external_ip]]
-        # We use external IPs to connect
-        ips = []
-        for internal_ip, external_ip in handle.stable_internal_external_ips:
-            # Prefer external IP, fall back to internal
-            ip = external_ip if external_ip else internal_ip
-            if ip:
-                ips.append(ip)
-
-        if not ips:
-            raise RuntimeError("No IP addresses found for cluster nodes")
-
-        return ips
-
-    def _wait_for_workers_ready(
-        self, expected_nodes: int, timeout: int = 300, poll_interval: int = 5
-    ) -> List[str]:
-        """Wait for workers to be ready and return their addresses."""
-        start_time = time.time()
-
-        while time.time() - start_time < timeout:
+        while time.time() - start < timeout:
             try:
-                ips = self._get_node_ips()
-                if len(ips) >= expected_nodes:
-                    logger.info(f"Found {len(ips)} nodes ready")
-                    return ips
+                request_id = jobs_sdk.queue_v2(refresh=False, skip_finished=False)
+                records, _, _, _ = sky.get(request_id)
+
+                all_named = [r for r in records if r.job_name == self._job_name]
+
+                if not all_named:
+                    elapsed = int(time.time() - start)
+                    logger.info(f"Waiting for job '{self._job_name}' to appear ({elapsed}s)...")
+                    time.sleep(poll_interval)
+                    continue
+
+                # When a job name is reused, multiple records exist. Use only
+                # the latest (highest job_id) to avoid matching stale runs.
+                latest_job_id = max(r.job_id for r in all_named)
+                job_records = [r for r in all_named if r.job_id == latest_job_id]
+
+                # Check for terminal failures
+                for r in job_records:
+                    if r.status in (
+                        managed_job_state.ManagedJobStatus.FAILED,
+                        managed_job_state.ManagedJobStatus.FAILED_SETUP,
+                        managed_job_state.ManagedJobStatus.CANCELLED,
+                    ):
+                        raise RuntimeError(
+                            f"Task '{r.task_name}' in job '{self._job_name}' "
+                            f"failed with status: {r.status}. "
+                            f"Check logs with: sky jobs logs {self._job_name}"
+                        )
+
+                running_task_names = {
+                    r.task_name
+                    for r in job_records
+                    if r.status == managed_job_state.ManagedJobStatus.RUNNING
+                }
+
+                # Map running task names to mesh names.
+                # Multi-task: task_name == mesh_name.
+                # Single-task: task_name == job_name; map to the only mesh.
+                running = set()
+                for mesh in expected:
+                    if mesh in running_task_names:
+                        running.add(mesh)
+                    elif (len(expected) == 1
+                          and self._job_name in running_task_names):
+                        running.add(mesh)
+
+                if expected <= running:
+                    logger.info(
+                        f"All tasks in '{self._job_name}' are RUNNING: {sorted(running)}"
+                    )
+                    return
+
+                elapsed = int(time.time() - start)
+                waiting_for = expected - running
+                logger.info(
+                    f"Waiting for tasks {waiting_for} to reach RUNNING ({elapsed}s)..."
+                )
+
+            except RuntimeError:
+                raise
             except Exception as e:
-                logger.debug(f"Waiting for workers: {e}")
+                logger.warning(f"Error polling job status: {e}")
 
             time.sleep(poll_interval)
 
         raise RuntimeError(
-            f"Timeout waiting for {expected_nodes} workers after {timeout}s"
+            f"Timeout after {timeout}s waiting for all tasks in '{self._job_name}' "
+            f"to reach RUNNING status."
         )
 
-    def _state(self) -> JobState:
-        """Get the current state with HostMesh objects for each mesh."""
-        if not self._jobs_active():
-            raise RuntimeError("SkyPilot cluster is not active")
-
-        # Get node IPs if not cached
-        if not self._node_ips:
-            total_nodes = sum(self._meshes.values())
-            self._node_ips = self._wait_for_workers_ready(total_nodes)
-
-        # Distribute IPs among meshes
-        host_meshes = {}
-        ip_idx = 0
-
-        for mesh_name, num_nodes in self._meshes.items():
-            mesh_ips = self._node_ips[ip_idx : ip_idx + num_nodes]
-            ip_idx += num_nodes
-
-            workers = [f"tcp://{ip}:{self._port}" for ip in mesh_ips]
-            logger.info(f"Connecting to workers for mesh '{mesh_name}': {workers}")
-
-            host_mesh = _attach_to_workers_wrapper(
-                name=mesh_name,
-                ca="trust_all_connections",
-                workers=workers,
-            )
-
-            # Wait for the host mesh to be initialized (connections established)
-            logger.info(f"Waiting for host mesh '{mesh_name}' to initialize...")
-            host_mesh.initialized.get()
-            logger.info(f"Host mesh '{mesh_name}' initialized successfully")
-
-            # Give connections a moment to fully stabilize
-            time.sleep(5)
-            logger.info(f"Host mesh '{mesh_name}' ready")
-
-            host_meshes[mesh_name] = host_mesh
-
-        return JobState(host_meshes)
-
-    def can_run(self, spec: "JobTrait") -> bool:
-        """Check if this job can run the given spec."""
-        if not isinstance(spec, SkyPilotJob):
-            return False
-
-        return (
-            spec._meshes == self._meshes
-            and spec._resources == self._resources
-            and spec._port == self._port
-            and self._jobs_active()
-        )
-
-    def _jobs_active(self) -> bool:
-        """Check if the SkyPilot cluster is still active."""
-        if not self.active or not self._launched_cluster_name:
-            return False
+    def _is_job_running(self) -> bool:
+        """Return True if the job group is still running."""
+        from sky.jobs.client import sdk as jobs_sdk
+        from sky.jobs import state as managed_job_state
 
         try:
-            request_id = sky.status(cluster_names=[self._launched_cluster_name])
-            statuses = sky.get(request_id)
-
-            if not statuses:
-                return False
-
-            status = statuses[0]
-            # Check if cluster is UP
-            return status.status == sky.ClusterStatus.UP
+            request_id = jobs_sdk.queue_v2(refresh=False, skip_finished=False)
+            records, _, _, _ = sky.get(request_id)
+            job_records = [r for r in records if r.job_name == self._job_name]
+            return any(
+                r.status == managed_job_state.ManagedJobStatus.RUNNING
+                for r in job_records
+            )
         except Exception as e:
-            logger.warning(f"Error checking cluster status: {e}")
+            logger.warning(f"Error checking job status: {e}")
             return False
-
-    def _kill(self) -> None:
-        """Tear down the SkyPilot cluster."""
-        if self._launched_cluster_name is not None:
-            try:
-                logger.info(
-                    f"Tearing down SkyPilot cluster '{self._launched_cluster_name}'"
-                )
-                request_id = sky.down(self._launched_cluster_name)
-                sky.get(request_id)
-                logger.info(f"Cluster '{self._launched_cluster_name}' terminated")
-            except Exception as e:
-                logger.warning(f"Failed to tear down cluster: {e}")
-
-        self._launched_cluster_name = None
-        self._node_ips.clear()

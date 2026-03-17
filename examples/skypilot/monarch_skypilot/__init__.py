@@ -7,19 +7,36 @@
 """
 Monarch SkyPilot Integration Package.
 
-This package provides SkyPilotJob - a way to run Monarch workloads on
-Kubernetes and cloud VMs via SkyPilot.
+This package provides SkyPilotJobGroup - a way to run Monarch workloads on
+Kubernetes and cloud VMs via SkyPilot's JobGroup abstraction.
+
+Each named Monarch mesh maps to a sky.Task with its own resource specification,
+all launched as a managed job group (sky.jobs.launch) for spot recovery and
+SAME_INFRA placement.
 
 Usage:
-    from monarch_skypilot import SkyPilotJob
+    from monarch_skypilot import SkyPilotJobGroup
 
-    job = SkyPilotJob(
-        meshes={"workers": 2},
-        resources=sky.Resources(cloud=sky.Kubernetes(), accelerators="H100:1"),
+    # Homogeneous: all meshes share the same resources
+    job = SkyPilotJobGroup(
+        meshes={"trainers": 4},
+        default_resources=sky.Resources(cloud=sky.Kubernetes(), accelerators="H100:8"),
     )
+
+    # Heterogeneous: per-mesh resource specifications
+    job = SkyPilotJobGroup(
+        meshes={
+            "trainers":    (4, sky.Resources(accelerators="H100:8")),
+            "dataloaders": (2, sky.Resources(cpus="32")),
+        },
+        primary_meshes=["trainers"],
+        termination_delays={"dataloaders": "30s"},
+    )
+
     state = job.state()
+    trainers = state.trainers  # HostMesh with 4 nodes
 """
 
-from .skypilot_job import SkyPilotJob
+from .skypilot_job import SkyPilotJobGroup
 
-__all__ = ["SkyPilotJob"]
+__all__ = ["SkyPilotJobGroup"]

@@ -32,6 +32,7 @@ envs:
   NUM_HOSTS: 2           # Number of worker nodes to provision
   GPUS_PER_HOST: 1       # GPUs per worker (set to 0 for CPU-only)
   ACCELERATOR: "H200:1"  # SkyPilot GPU spec (set to "none" for CPU-only). Keep quantity aligned with GPUS_PER_HOST.
+  JOB_NAME: "monarch-workers"  # Name for the managed job group
 
 # Sync the current directory (examples/skypilot) to the cluster
 workdir: .
@@ -53,7 +54,7 @@ setup: |
   echo "=== Installing Python dependencies ==="
   uv pip install --system torchmonarch-nightly
   # Install SkyPilot with Kubernetes support for launching nested clusters
-  uv pip install --system "skypilot[kubernetes]"
+  uv pip install --system "skypilot-nightly[kubernetes]"
 
   # Verify installations
   python -c "import monarch; print(f'Monarch installed: {monarch}')"
@@ -83,7 +84,7 @@ run: |
     --cloud kubernetes \
     --num-hosts $NUM_HOSTS \
     --gpus-per-host $GPUS_PER_HOST \
-    --cluster-name monarch-workers \
+    --job-name "$JOB_NAME" \
     --accelerator "$ACCELERATOR"
 
   echo "=== Example ran successfully ==="
